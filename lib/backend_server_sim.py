@@ -1,11 +1,11 @@
-from bdb import effective
 import time, cv2, json
 import numpy as np
 from com_socket import CBackEndSocket
 from matplotlib import colors, pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib import animation
-from argparse import ArgumentParser
+import multiprocessing, ctypes
+from threading import Lock, Thread
 
 class PlotSticks:
 
@@ -97,6 +97,24 @@ class PlotSticks:
         
         return self.sticks_anim
 
+def plot_sticks( sk_pos_share, sk_pos_lock ):
+    coco_ue4_pose_sticks_define=[
+    #sticks define
+    [0,1],[5,3,1,2,4],[11,9,7,0,6,8,10],[7,13],[6,12],[17,15,13,12,14,16]
+    ]
+    PlotSticks_Ins = PlotSticks( coco_ue4_pose_sticks_define, None, (-80,100) );
+    PlotSticks_Ins.setAxisLabel( "aixs_X", "axis_Y", "axis_Z" )
+    while( True ):
+        skeleton_pos = None
+        sk_pos_lock.acquire()
+        if len(sk_pos_share) > 0:
+            skeleton_pos = sk_pos_share[0]
+            sk_pos_share.pop(0)
+        sk_pos_lock.release()
+        if skeleton_pos is not None:
+            PlotSticks_Ins.update( skeleton_pos )
+        time.sleep(0.01)
+
 class TimerCounter():
   def __init__(self, freq) -> None:
       self.timers={}
@@ -132,7 +150,7 @@ class TimerCounter():
 
       return self.timers
 
-def gen_interface_img( mc_mode,  mc_triger, mc_playback,mc_tracker, mc_status ):
+def gen_interface_img( mc_mode,  mc_triger, mc_playback,mc_tracker, mc_status, mc_reprojection ):
     img = np.zeros((1080,120, 3), np.uint8)
     img.fill(200)
     valid_color = (255,0,0)
@@ -141,29 +159,30 @@ def gen_interface_img( mc_mode,  mc_triger, mc_playback,mc_tracker, mc_status ):
     cv2.rectangle(img, (10, 100), (110, 200), (0,0,255), 2)
     cv2.rectangle(img, (10, 300), (110, 400), (0,0,255), 2)
     cv2.rectangle(img, (10, 500), (110, 600), (0,0,255), 2)
-    cv2.putText(img, mc_mode, (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, valid_color, 2)
+    cv2.rectangle(img, (10, 700), (110, 800), (0,0,255), 2)
+    cv2.putText(img, "mod_"+mc_mode, (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, valid_color, 2)
     cv2.putText(img, mc_triger, (30, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.8, valid_color if mc_mode == "manual" else invalide_color, 2)
-    cv2.putText(img, mc_playback, (30, 560), cv2.FONT_HERSHEY_SIMPLEX, 0.8, valid_color, 2)
-    cv2.putText(img, "t:["+str(mc_tracker["x"])+","+str(mc_tracker["y"])+"]", (0, 720), cv2.FONT_HERSHEY_SIMPLEX, 0.6, valid_color if mc_mode == "manual" else invalide_color, 2)
-    cv2.putText(img, "s:"+mc_status, (0, 850), cv2.FONT_HERSHEY_SIMPLEX, 1.0, valid_color, 2)
+    cv2.putText(img, "ply_"+mc_playback, (30, 560), cv2.FONT_HERSHEY_SIMPLEX, 0.8, valid_color, 2)
+    cv2.putText(img, "prj_"+mc_reprojection, (30, 760), cv2.FONT_HERSHEY_SIMPLEX, 0.8, valid_color, 2)
+    cv2.putText(img, "t:["+str(mc_tracker["x"])+","+str(mc_tracker["y"])+"]", (0, 920), cv2.FONT_HERSHEY_SIMPLEX, 0.6, valid_color if mc_mode == "manual" else invalide_color, 2)
+    cv2.putText(img, "s:"+mc_status, (0, 1050), cv2.FONT_HERSHEY_SIMPLEX, 1.0, valid_color, 2)
     return img
 
-if __name__ == '__main__':
-    args = ArgumentParser(description="opt")
-    args.add_argument(
-        "--opt",
-        default='wide',
-        help="please enter the option: wide /telefocus",
-        type=str,
-    )
-    opt = args.parse_args()
-    sim_opt = opt.opt
-    tc = TimerCounter( 300 )
-    tc.tStart("rev")
+def add_projection_points( img, projection_points_dict ):
+    h,w,c = img.shape
+    galvo_num = w//1440
+    for galvo_index in range(galvo_num):
+        x_offset = galvo_index*1440
+        for coord in projection_points_dict["pose_reprojection_"+str(galvo_index)]:
+            cv2.circle(img, (int(coord["x"]*1440+x_offset),int(coord["y"]*1080)), 20, (0,255,0), 2)
 
+    return img
+
+def rev_wide_window( ip, port, galvos_num_, enable_record, mc_id_share, mc_fps_share, mc_reprojection_share, share_lock ):
+    global galvos_num, mc_mode, mc_triger, mc_playback, mc_tracker, mc_reprojection, cmd_sck
     def event_cam_wide_lbutton_down(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            global galvos_num, mc_mode, mc_triger, mc_playback, mc_tracker, cmd_sck
+            global galvos_num, mc_mode, mc_triger, mc_playback, mc_tracker, mc_reprojection, cmd_sck
             offset_x = galvos_num*1920
             if x > (offset_x+10) and x < (offset_x+110) and y > 100 and y < 200:
                 if mc_mode == "automation":
@@ -186,110 +205,172 @@ if __name__ == '__main__':
                 else:
                     mc_playback = "enable"
                 cmd_sck.sendCMD( "mc_playback", mc_playback )
+            
+            if x > (offset_x+10) and x < (offset_x+110) and y > 700 and y < 800:
+                if mc_reprojection == "enable":
+                    mc_reprojection = "disable"
+                else:
+                    mc_reprojection = "enable"
 
             if mc_mode == "manual":
                 if x < offset_x and y < 1080 and mc_mode == "manual":
-                    mc_tracker = {"x":x,"y":y}
+                    mc_tracker = {"cam_index":x//1920,"x":(x-(x//1920)*1920)/1920.0,"y":y/1080.0}
                     cmd_sck.sendCMD( "mc_tracker", mc_tracker  )
+    
+    tc = TimerCounter( 300 )
+    tc.tStart("rev_wide")
 
-    ip = "192.168.123.68"
-    port = 6000
-    if sim_opt == "wide":
-        wide_img_sck =  CBackEndSocket(ip, port, True, True, False )
-        cmd_sck      =  CBackEndSocket(ip, port+1, False, True, True )
-    else:
-        telefocus_img_sck =  CBackEndSocket(ip, port+2, True, False, False )
-    run_freq = 300
-    save_path = "./"
-    galvos_num = 2
-    enable_record = False
+    galvos_num = galvos_num_;
+    wide_img_sck =  CBackEndSocket(ip, port, True, True, False )
+    cmd_sck  =  CBackEndSocket(ip, port+1, False, True, True )
 
     mc_mode = "automation"
     mc_triger="finish" 
     mc_tracker={"x":0,"y":0}
     mc_status="None"
     mc_playback="disable"
+    mc_reprojection = "disable"
 
-    if sim_opt == "wide":
-        cv2.namedWindow("cam Wide", 0)
-        cv2.setMouseCallback("cam Wide",   event_cam_wide_lbutton_down)
-    else:
-        cv2.namedWindow("cam Telefocus",0)
-        coco_ue4_pose_sticks_define=[
-        #sticks define
-        [0,1],[5,3,1,2,4],[11,9,7,0,6,8,10],[7,13],[6,12],[17,15,13,12,14,16]
-        ]
-        #PlotSticks_Ins = PlotSticks( coco_ue4_pose_sticks_define, None, (-80,100) )
-        #PlotSticks_Ins.setAxisLabel( "aixs_X", "axis_Y", "axis_Z" )
-
-    save_txt_file = None
-    save_video_file = None
-    mc_fps = 30
-    mc_id = ""
+    cv2.namedWindow("cam Wide", 0)
+    cv2.setMouseCallback("cam Wide",   event_cam_wide_lbutton_down)
     wide_img = np.zeros((1080,1920*galvos_num, 3), np.uint8)
-    telefocus_img = np.zeros((1440*galvos_num, 1080, 3), np.uint8)
-    imshow_flag = False;
+
     while( True ):
-        if sim_opt == "wide":
-            rev_wide_img  = wide_img_sck.receiveWideImage(  )
-            if rev_wide_img is not None:
-                wide_img = rev_wide_img
-                interface_img = gen_interface_img( mc_mode,  mc_triger, mc_playback, mc_tracker, mc_status )
-                wide_img_show = np.concatenate((wide_img, interface_img), axis=1 )
-                cv2.imshow("cam Wide", wide_img_show)
-                imshow_flag = True;
-                tc.tEnd("rev")
-                tc.getResult()
-                tc.tStart("rev")
+        rev_wide_img  = wide_img_sck.receiveWideImage(  )
+        if rev_wide_img is not None:
+            wide_img = rev_wide_img
+            interface_img = gen_interface_img( mc_mode,  mc_triger, mc_playback, mc_tracker, mc_status, mc_reprojection )
+            wide_img_show = np.concatenate((wide_img, interface_img), axis=1 )
+            cv2.imshow("cam Wide", wide_img_show)
+            tc.tEnd("rev_wide")
+            tc.getResult()
+            tc.tStart("rev_wide")
 
-            cmd = cmd_sck.receiveCMD( "mc_status" )
-            if cmd is not None:
-                mc_status = cmd
-                print("get mc_status:",mc_status)
-                if enable_record:
-                    if "start" in mc_status:
-                        mc_id = mc_status[mc_status.find("_")+1:mc_status.rfind("_")]
-                        mc_fps = int(mc_status[mc_status.rfind("_")+1:-2])
-                        save_txt_file = open(save_path+mc_id+".txt",mode='w')
-                        save_video_file = cv2.VideoWriter(save_path+mc_id+".avi", cv2.VideoWriter_fourcc(*'XVID'), mc_fps, (1440*galvos_num, 1080))
-                        print("start recording file id [{}] at fps [{}]".format(save_path+mc_id, mc_fps))
-                    elif "finished" in mc_status:
-                        if save_txt_file is not None:
-                            save_txt_file.close()
-                            save_txt_file = None
-                        if save_video_file is not None:
-                            save_video_file.release()
-                            save_video_file = None
-                        print("stop recording file")
-
-        else:
-            pos, rev_telefocus_img = telefocus_img_sck.receivePosAndTelefocusImg( )
-            if pos is not None and rev_telefocus_img is not None:
-                cv2.imshow("cam Telefocus", rev_telefocus_img)
-                imshow_flag = True;
-                tc.tEnd("rev")
-                tc.getResult()
-                tc.tStart("rev")
-
-                # print("pose:", pos)
-                skeleton_pos = np.zeros((len(pos['pose_world']),3))
-                for index in range(len( pos['pose_world'] )):
-                    skeleton_pos[index] = np.array([float(pos['pose_world'][index]['x']),float(pos['pose_world'][index]['y']),float(pos['pose_world'][index]['z'])])
-                #PlotSticks_Ins.update( skeleton_pos )
-                
-                if enable_record:
-                    if save_txt_file is not None:
-                        str_skeleton_pos =json.dumps(pos)
-                        save_txt_file.write( str_skeleton_pos ); save_txt_file.write('\n');
-                    if save_video_file is not None:
-                        save_video_file.write( rev_telefocus_img )
-
-        if imshow_flag:
             key_press = cv2.waitKey(1) & 0xFF
             if key_press == ord('b'):
                 break;
-            imshow_flag = False;
+            
+            share_lock.acquire()
+            mc_reprojection_share.set( mc_reprojection )
+            share_lock.release()
 
-        # time.sleep( 1.0/run_freq )
+        cmd = cmd_sck.receiveCMD( "mc_status" )
+        if cmd is not None:
+            mc_status = cmd
+            print("get mc_status:",mc_status)
+            if enable_record:
+                if "start" in mc_status:
+                    share_lock.acquire()
+                    mc_id_share.set( mc_status[mc_status.find("_")+1:mc_status.rfind("_")] )
+                    mc_fps_share.set( int(mc_status[mc_status.rfind("_")+1:-2]) )
+                    share_lock.release()
+                    
+                elif "finished" in mc_status:
+                    share_lock.acquire()
+                    if mc_id_share.get() != "none":
+                        mc_id_share.set("none")
+                    if mc_fps_share.get() != 0:
+                        mc_fps_share.set( 0 )
+                    share_lock.release()
+                    print("stop recording file")
+        
 
+def rev_telefocus_window( ip, port, galvos_num_, enable_record, mc_id_share, mc_fps_share, mc_reprojection_share, share_lock, sk_pos_share, sk_pos_lock ):
+    tc = TimerCounter( 300 )
+    tc.tStart("rev_telefocus")
+    img_show = False
+    save_path = "./"
+    save_txt_file =  None
+    save_video_file = None
+    mc_id = "none"
+    mc_fps = 0
+    mc_reprojection = "disable"
+
+    telefocus_img_sck =  CBackEndSocket(ip, port+2, True, False, False )
+    
+    if img_show:
+        cv2.namedWindow("cam Telefocus",0)
+    telefocus_img = np.zeros((1440*galvos_num, 1080, 3), np.uint8)
+
+    while( True ):
+        pos, rev_telefocus_img = telefocus_img_sck.receivePosAndTelefocusImg( )
+        if pos is not None and rev_telefocus_img is not None:
+            share_lock.acquire()
+            mc_reprojection = mc_reprojection_share.get()
+            share_lock.release()
+            if mc_reprojection == "enable":
+                rev_telefocus_img = add_projection_points( rev_telefocus_img, pos )
+
+            if img_show:
+                cv2.imshow("cam Telefocus", rev_telefocus_img)
+                key_press = cv2.waitKey(1) & 0xFF
+                if key_press == ord('b'):
+                    break;
+            
+            tc.tEnd("rev_telefocus")
+            tc.getResult()
+            tc.tStart("rev_telefocus")
+
+            # print("pose:", pos)
+            skeleton_pos = np.zeros((len(pos['pose_world']),3))
+            for index in range(len( pos['pose_world'] )):
+                skeleton_pos[index] = np.array([float(pos['pose_world'][index]['x']),float(pos['pose_world'][index]['y']),float(pos['pose_world'][index]['z'])])
+            sk_pos_lock.acquire()
+            sk_pos_share.append( skeleton_pos )
+            sk_pos_lock.release()
+            
+            if enable_record:
+                share_lock.acquire()
+                mc_id_temp = mc_id_share.get()
+                mc_fps_temp = mc_fps_share.get()
+                share_lock.release()
+
+                if mc_id_temp != "none" and mc_id == "none":
+                    save_txt_file = open(save_path+mc_id_temp+".txt",mode='w')
+                    save_video_file = cv2.VideoWriter(save_path+mc_id_temp+".avi", cv2.VideoWriter_fourcc(*'XVID'), mc_fps_temp, (1440*galvos_num, 1080))
+                    print("start recording file id [{}] at fps [{}]".format(save_path+mc_id_temp, mc_fps_temp))
+
+                if mc_id_temp == "none" and mc_id != "none":
+                    if save_txt_file is not None:
+                        save_txt_file.close()
+                        save_txt_file = None
+                    if save_video_file is not None:
+                        save_video_file.release()
+                        save_video_file = None
+                    print("finished recording file id [{}] at fps [{}]".format(save_path+mc_id, mc_fps))
+
+                mc_id = mc_id_temp; mc_fps = mc_fps_temp;
+
+                if save_txt_file is not None:
+                    str_skeleton_pos =json.dumps(pos)
+                    save_txt_file.write( str_skeleton_pos+'\n' ); 
+
+                if save_video_file is not None:
+                    save_video_file.write( rev_telefocus_img )
+                
+
+if __name__ == '__main__':
+
+    ip = "192.168.123.68"
+    port = 6000
+    galvos_num = 2
+    enable_record = True
+
+    mc_id_share =  multiprocessing.Manager().Value( ctypes.c_char_p, 'none' )
+    mc_fps_share = multiprocessing.Manager().Value( ctypes.c_int, 0 )
+    mc_reprojection_share = multiprocessing.Manager().Value( ctypes.c_char_p, 'disable' )
+    share_lock = multiprocessing.Manager().Lock()
+    sk_pos_share = multiprocessing.Manager().list()
+    sk_pos_lock = multiprocessing.Manager().Lock()
+
+    rev_wide_window_process = multiprocessing.Process(target=rev_wide_window,args=(ip, port, galvos_num, enable_record, mc_id_share, mc_fps_share, mc_reprojection_share, share_lock))
+    rev_wide_window_process.start()
+    rev_telefocus_window_process = multiprocessing.Process(target=rev_telefocus_window,args=(ip, port, galvos_num, enable_record, mc_id_share, mc_fps_share, mc_reprojection_share, share_lock, sk_pos_share, sk_pos_lock))
+    rev_telefocus_window_process.start()
+    plot_sticks_process = multiprocessing.Process(target=plot_sticks,args=(sk_pos_share, sk_pos_lock))
+    plot_sticks_process.start()
+
+    rev_wide_window_process.join()
+    rev_telefocus_window_process.join()
+    plot_sticks_process.join()
     print("finished back_end server simulation!")

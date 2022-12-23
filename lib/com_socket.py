@@ -49,8 +49,8 @@ class CAlogrithmSocket:
         self.massSend_thread.join();
         self.cmd_receiving_thread.join();
 
-    def sendMCStatus( self, status, id ):
-        status_dict = {"mc_status": status+"_"+id}
+    def sendMCStatus( self, status, id, freq ):
+        status_dict = {"mc_status": status+"_"+id+"_"+str(freq)+"hz"}
         status_dict = json.dumps( status_dict ).encode("ascii")
         pkgs = self.__package( status_dict )
         for pkg in pkgs:
@@ -97,6 +97,7 @@ class CAlogrithmSocket:
             if pkgs  is not None:
                 for pkg in pkgs:
                     self.socket_udp.sendto(pkg, (self.com_ip, self.com_port))
+                    time.sleep(0.0001)
             else:
                 time.sleep( 0.001 )
 
@@ -134,7 +135,7 @@ class CAlogrithmSocket:
             #img_code = img_code.tostring()
             img_code = self.turbojpeg.encode( img )
             pos_code = json.dumps( pos ).encode("ascii")
-            pos_code = self.__alignCompletion( pos_code, 3000 )
+            pos_code = self.__alignCompletion( pos_code, 7000 )
             pos_img_code = pos_code + img_code
             pkgs = self.__package( pos_img_code )
             self.udp_buf_lck.acquire();
@@ -264,8 +265,9 @@ class CBackEndSocket: #using c++ library
         cmd_val = None
         self.cmd_vars_lck.acquire()
         if cmd in self.cmd_vars_dict.keys():
-            cmd_val = self.cmd_vars_dict[cmd]
-            self.cmd_vars_dict[cmd] = None
+            if len( self.cmd_vars_dict[cmd] ) > 0:
+                cmd_val = self.cmd_vars_dict[cmd][0]
+                self.cmd_vars_dict[cmd].pop(0)
         self.cmd_vars_lck.release( )
         return cmd_val
 
@@ -333,8 +335,8 @@ class CBackEndSocket: #using c++ library
         if pos_img_code is not None:
             #img_code = np.frombuffer( img_code, dtype = "uint8" )
             #img = cv2.imdecode( img_code, cv2.IMREAD_COLOR )
-            img = self.turbojpeg.decode( pos_img_code[3000:], pixel_format=TJPF_BGR)
-            pos_code = pos_img_code[:3000].decode("ascii")
+            img = self.turbojpeg.decode( pos_img_code[7000:], pixel_format=TJPF_BGR)
+            pos_code = pos_img_code[:7000].decode("ascii")
             pos = json.loads(pos_code)
             self.decoder_buf_lck.acquire()
             self.decoder_buf.append( [pos, img] )
@@ -353,7 +355,11 @@ class CBackEndSocket: #using c++ library
                 pkg_body, received_finished = self.__parseRevPkgHead( pkg, pkg_body )
                 if received_finished and pkg_body is not None:
                     self.cmd_vars_lck.acquire()
-                    self.cmd_vars_dict.update( self.__parseRevPkgBodyControlVars( pkg_body ) )
+                    cmd_vars_dict_temp = self.__parseRevPkgBodyControlVars( pkg_body )
+                    for k, v in cmd_vars_dict_temp.items():
+                        if k not in self.cmd_vars_dict.keys():
+                            self.cmd_vars_dict[k] = []
+                        self.cmd_vars_dict[k].append( v )
                     self.cmd_vars_lck.release()
                     pkg_body = None
 
@@ -422,7 +428,7 @@ if __name__ == '__main__':
     wide_img_sck =  CAlogrithmSocket(host_ip, host_port, True, True, False )
     cmd_sck      =  CAlogrithmSocket(host_ip, host_port+1, False, True , True )
     telefocus_img_sck =  CAlogrithmSocket(host_ip, host_port+2, True, False, False )
-    run_freq = 50
+    run_freq = 80 #40fps
     galvos_num = 2
 
     mc_mode = "automation"
@@ -431,6 +437,7 @@ if __name__ == '__main__':
     mc_status="finished"
     mc_playback="disable"
     mc_id = ""
+    record_freq = 35
 
     cv2.namedWindow("cam_Wide_Send",0)
     cv2.namedWindow("cam_Telefocus_Send",0)
@@ -438,22 +445,45 @@ if __name__ == '__main__':
     wide_img = np.zeros((1080,1920*galvos_num, 3), np.uint8)
     telefocus_img = np.zeros((1080, 1440*galvos_num, 3), np.uint8)
     pos_num = 0
+    play_back_counter = 0;
     while( True ):
         cmd = cmd_sck.receiveCMD( "mc_mode" )
         if cmd is not None:
             mc_mode = cmd
             print("get mc_mode: ",mc_mode)
 
-        cmd = cmd_sck.receiveCMD( "mc_triger" )
+        cmd = cmd_sck.receiveCMD( "mc_playback" )
         if cmd is not None:
+            mc_playback = cmd
+            print("get mc_playback: ",mc_playback)
+
+        cmd = cmd_sck.receiveCMD( "mc_triger" )
+        if cmd is not None and play_back_counter == 0:
             mc_triger = cmd
             print("get mc_triger: ",mc_triger)
             if mc_triger == "start":
                 mc_status = "start"
                 mc_id = time.strftime("%Y_%m_%d_%H_%M_%S")
+                record_freq = 35
+                cmd_sck.sendMCStatus( mc_status, mc_id, record_freq )
+            elif mc_triger == "finish":
+                mc_status = "finished"
+                cmd_sck.sendMCStatus( copy.deepcopy(mc_status), copy.deepcopy(mc_id), copy.deepcopy(record_freq) )
                 if mc_playback == "enable":
-                    mc_id = "p_"+mc_id
-                
+                    time.sleep(0.1)
+                    play_back_counter = play_back_counter + 1
+                    mc_status = "start"
+                    mc_id = "p_" + mc_id
+                    record_freq = 100
+                    cmd_sck.sendMCStatus( mc_status, mc_id, record_freq )
+
+        if play_back_counter > 0:
+            play_back_counter = play_back_counter + 1
+            if play_back_counter > 1000:
+                play_back_counter = 0
+                mc_status = "finished"
+                cmd_sck.sendMCStatus( mc_status, mc_id, record_freq )
+
         cmd = cmd_sck.receiveCMD( "mc_tracker" )
         if cmd is not None:
             mc_tracker = cmd
@@ -465,6 +495,8 @@ if __name__ == '__main__':
         if pos_num > 1000:
             pos_num = 0
         pos = {"pose_world":[{"x":i+pos_num,"y":i+pos_num+1, "z":i+pos_num+2 } for i in range(18)] }
+        for galvo_index in range(galvos_num):
+            pos.update({"pose_reprojection_"+str(galvo_index):[{"x":(i+pos_num+galvo_index)/1050.0, "y":(i+pos_num+galvo_index)/1050.0} for i in range(18)]})
         #sending pictures
         wide_img_sck.sendWideImage( send_wide_img )
         telefocus_img_sck.sendPosAndTelefocusImg( send_telefocus_img, pos )

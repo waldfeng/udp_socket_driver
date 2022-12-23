@@ -79,13 +79,20 @@ void massReceiving( int port, int pkg_size )
                         memcpy( pkg_body_ptr->pkg_bdy+pkg_index*(pkg_size-100), pkg_buffer+100, sizeof(char)*last_pkg_len);
                         pkg_body_ptr->pkg_bdy_size_counter = pkg_body_ptr->pkg_bdy_size_counter + last_pkg_len;
 
-                        pkg_bdy_buffer.push_back( pkg_body_ptr );
-                        if( pkg_bdy_buffer.size() > MAX_UDP_BUFFER )
+                        if( pkg_body_ptr->pkg_bdy_size_counter == ((all_pkgs-1)*(pkg_size-100) + last_pkg_len) )
                         {
-                            cout<<"packages body buffer over flow:["<<pkg_bdy_buffer.size()<<"]"<<endl;
-                            delete [] pkg_bdy_buffer.front()->pkg_bdy;
-                            pkg_bdy_buffer.front().reset();
-                            pkg_bdy_buffer.pop_front();
+                            pkg_bdy_buffer.push_back( pkg_body_ptr );
+                            if( pkg_bdy_buffer.size() > MAX_UDP_BUFFER )
+                            {
+                                cout<<"packages body buffer over flow:["<<pkg_bdy_buffer.size()<<"]"<<endl;
+                                delete [] pkg_bdy_buffer.front()->pkg_bdy;
+                                pkg_bdy_buffer.front().reset();
+                                pkg_bdy_buffer.pop_front();
+                            }
+                        }
+                        else
+                        {
+                            delete [] pkg_body_ptr->pkg_bdy;
                         }
                     }
                     else
