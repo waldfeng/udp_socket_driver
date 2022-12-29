@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-project(udp_socket LANGUAGES CXX)
+project(tcp_socket LANGUAGES CXX)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
@@ -26,13 +26,13 @@ link_directories(
     /usr/lib/**
 )
 
-add_library(udp_socket SHARED
-src/udp_socket.cpp
+add_library(tcp_socket SHARED
+src/tcp_socket.cpp
 )
 
-add_executable(udp_com
-src/main_udp_socket.cpp
+add_executable(tcp_com
+src/main_tcp_socket.cpp
 )
 
-target_link_libraries(udp_socket -ljsoncpp  boost_system boost_thread rt )
-target_link_libraries(udp_com udp_socket)
+target_link_libraries(tcp_socket -ljsoncpp  boost_system boost_thread rt )
+target_link_libraries(tcp_com tcp_socket)

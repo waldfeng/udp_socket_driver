@@ -7,55 +7,60 @@ import json
 from turbojpeg import TurboJPEG, TJPF_BGR
 import ctypes, os, copy
 
+server_ip = "192.168.123.68"
 host_ip = "192.168.123.67"
-host_port = 6000
+communication_port = 6000
 
 class CAlogrithmSocket:
-    def __init__(self, ip, port, enable_mass_send=False, send_wide_or_telefocus_img=False, enable_cmd_receiving=False) -> None:
+    def __init__(self, ip, port, cmdRecv_massSend=False, send_wide_or_telefocus_img=False ) -> None:
         self.socket_run = True
-        self.socket_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        print("created socket, target ip:[{}], target port:[{}]".format(ip, port))
+        self.socket_tcp = None
+        self.new_connection = None
         self.com_ip = ip
         self.com_port = port
         self.buffer_size = 3
+        self.pkg_head_len = 20
         self.turbojpeg = TurboJPEG()
-        if enable_mass_send:
+
+        if cmdRecv_massSend:
+            self.cmd_vars_lck = Lock()
+            self.cmd_vars_dict = {}
+            self.cmd_receiving_thread = Thread(target=self.__cmd_receiving );
+            self.cmd_receiving_thread.start()
+            self.cmd_receiving_thread.setName('sck_cmd_rev_'+str(self.com_port))
+            print("started new thread [{}] for tcp communication of command data".format(self.cmd_receiving_thread.getName()))    
+        else:
+            self.tcp_buf_lck = Lock()
+            self.tcp_buf = []            
+            self.massSend_thread = Thread(target=self.__massSend );
+            self.massSend_thread.start()
+            self.massSend_thread.setName('sck_mass_send_'+str(self.com_port))
+            print("started new thread [{}] for tcp mass sending data".format(self.massSend_thread.getName()))
+
             self.encoder_buf_lck = Lock()
             self.encoder_buf = []
             self.imgEncoder_thread = Thread(target=self.__imgEncoder, args=(send_wide_or_telefocus_img, 100) );
             self.imgEncoder_thread.start()
             self.imgEncoder_thread.setName('img_encoder_'+str(self.com_port))
             print("started new thread [{}] for encoding image data".format(self.imgEncoder_thread.getName()))
-            
-            self.udp_buf_lck = Lock()
-            self.udp_buf = []
-            self.massSend_thread = Thread(target=self.__massSend );
-            self.massSend_thread.start()
-            self.massSend_thread.setName('sck_mass_send_'+str(self.com_port))
-            print("started new thread [{}] for udp mass sending data".format(self.massSend_thread.getName()))
-            
-
-        if enable_cmd_receiving:
-            self.socket_udp.bind( ('',self.com_port) )
-            self.cmd_receiving_thread = Thread(target=self.__cmd_receiving );
-            self.cmd_receiving_thread.start()
-            self.cmd_receiving_thread.setName('sck_cmd_rev_'+str(port))
-            print("started new thread [{}] for udp command receiving data".format(self.cmd_receiving_thread.getName()))
-            self.cmd_vars_lck = Lock()
-            self.cmd_vars_dict = {}
 
     def __del__( self ):
         self.socket_run = False
         self.massSend_thread.join();
         self.cmd_receiving_thread.join();
+        if self.new_connection != None:
+            self.new_connection.close()
+        self.socket_tcp.close()
 
     def sendMCStatus( self, status, id, freq ):
         status_dict = {"mc_status": status+"_"+id+"_"+str(freq)+"hz"}
         status_dict = json.dumps( status_dict ).encode("ascii")
-        pkgs = self.__package( status_dict )
-        for pkg in pkgs:
-            self.socket_udp.sendto(pkg, (self.com_ip, self.com_port))
-
+        pkg = self.__package( status_dict )
+        if self.new_connection == None:
+            print("can't send mc status, as connection failed!")
+        else:
+            self.__sendPkg( self.new_connection, pkg )
+        
     def receiveCMD( self, cmd ):
         cmd_val = None
         self.cmd_vars_lck.acquire()
@@ -86,20 +91,176 @@ class CAlogrithmSocket:
             else:
                 self.__encodePosAndTelefocusImg( quality )
 
+    def __waitingForConnect( self ):
+        #waitting for connecting
+        if self.socket_tcp != None:
+            self.socket_tcp.close()
+        self.socket_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+        self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
+        self.socket_tcp.settimeout( 3 )
+        print("created socket, target ip:[{}], target port:[{}]".format(self.com_ip, self.com_port))
+        self.socket_tcp.bind( ('',self.com_port) )
+        self.socket_tcp.listen( 3 )
+        print("............listening at ip:[{}] port:[{}]".format(socket.gethostbyname(socket.gethostname()), self.com_port))
+        connecton = None; addr = None;
+        while self.socket_run:
+            try:
+                connecton,addr = self.socket_tcp.accept()
+                if connecton != socket.error and addr[0] == self.com_ip:
+                    print("new connection at port [{}] was found from [{}]".format(self.com_port, addr))    
+                    break;
+            except socket.timeout:
+                pass
+            time.sleep( 0.001 )
+        return connecton, addr, True
+
+    def __sendData( self, connection, data ):
+        connection_ok = True; send_ok = True
+        try:
+            if not connection.send(data):
+                connection_ok = False
+        except socket.timeout:
+            send_ok = False
+        except:
+            connection_ok = False;
+        return connection_ok, send_ok
+
+    def __recvDataPart( self, connection, data_len ):
+        connection_ok = True; recv_ok = True
+        recv_len = 0;
+        recv_data = b'';
+        times_counter = 200;
+        while recv_len < data_len and connection_ok and times_counter > 0:
+            try:
+                recv_data_temp = connection.recv( data_len )
+                if recv_data_temp:
+                    recv_len += len( recv_data_temp )
+                    recv_data += recv_data_temp
+                else:
+                    connection_ok = False
+                times_counter -= 1
+            except socket.timeout:
+                recv_ok = False
+            except:
+                connection_ok = False
+        
+        if times_counter == 0:
+            recv_ok = False
+
+        return connection_ok, recv_ok, recv_data
+
+    def __recvData( self, connection ):
+        #receiving data_head
+        connection_ok, recv_ok, recv_data_head = self.__recvDataPart( connection, self.pkg_head_len )
+        if connection_ok == False or recv_ok == False:
+            return False, False, None #reset connection
+
+        head_ok = True
+        try:
+            data_head_decode = recv_data_head.decode("ascii")
+        except:
+            head_ok = False
+        if head_ok:
+            if data_head_decode[:11] != "pkg_length:":
+                head_ok = False
+        if head_ok == False:
+            return False, False, None #reset connection
+        
+        #receiving data_body
+        connection_ok, recv_ok, recv_data = self.__recvDataPart( connection, int( data_head_decode[11:self.pkg_head_len] ) )
+        if connection_ok == False or recv_ok == False:
+            return False, False, None #reset connection
+        return connection_ok, recv_ok, recv_data
+
+    def __sendPkg( self, connection, pkg ):
+        connection_ok, send_ok = self.__sendData( connection, pkg )
+        if connection_ok == False or send_ok == False:
+            return False, False
+
+        #receiving ack
+        connection_ok, recv_ok, recv_data = self.__recvData( connection )
+        if connection_ok == False or recv_ok == False:
+            return False, False
+
+        ack_ok = True
+        try:
+            recv_ack_decode = recv_data.decode("ascii")
+        except:
+            ack_ok = False
+        if ack_ok and len( recv_ack_decode ) >= 11:
+            if recv_ack_decode[:11] != "response:ok":
+                print("response ack error:", recv_ack_decode)
+                ack_ok = False
+        if ack_ok == False:
+            return False, False
+
+        return connection_ok, send_ok
+
+    def __recvPkg( self, connection ):
+        #receiving pkg_body
+        connection_ok, recv_ok, recv_data = self.__recvData( connection )
+        if connection_ok == False or recv_ok == False:
+            return False, False, None
+        
+        #sending response
+        ack = "response:ok"
+        ack_pkg = self.__package( ack.encode("ascii") )
+        connection_ok, send_ok = self.__sendData( connection, ack_pkg )
+        if connection_ok == False or send_ok == False:
+            return False, False, None
+
+        return connection_ok, recv_ok, recv_data
+
     def __massSend( self ):
+        send_counter = 0;
         while( self.socket_run ):
-            pkgs = None
-            self.udp_buf_lck.acquire();
-            if len( self.udp_buf ) > 0:
-                pkgs = self.udp_buf[0]
-                self.udp_buf.pop(0)
-            self.udp_buf_lck.release();
-            if pkgs  is not None:
-                for pkg in pkgs:
-                    self.socket_udp.sendto(pkg, (self.com_ip, self.com_port))
-                    time.sleep(0.0001)
-            else:
-                time.sleep( 0.001 )
+            self.new_connection = None
+            connection, addr, connection_ok = self.__waitingForConnect()
+            if connection_ok:
+                self.new_connection = connection
+            while connection_ok and self.socket_run:
+                pkg = None;
+                self.tcp_buf_lck.acquire();
+                if len( self.tcp_buf ) > 0:
+                    pkg = self.tcp_buf[0]
+                    self.tcp_buf.pop(0)
+                self.tcp_buf_lck.release();
+                if pkg  is not None:
+                    #sending package body
+                    connection_ok, send_ok = self.__sendPkg( connection, pkg )
+                    #for debuging.....
+                    send_counter = send_counter+1
+                    print("send package len:{}, send_counter:{}".format(pkg[:20].decode("ascii"), send_counter))
+                else:
+                    time.sleep( 0.001 )
+                
+                if connection_ok == False or self.socket_run == False:
+                    connection.close()
+                    self.new_connection = None
+                    self.socket_tcp.close()
+                    self.socket_tcp = None
+                    print("connection error at port [{}] occured from [{}], disconnecting......".format(self.com_port, addr))
+
+    def __cmd_receiving( self ):
+        while( self.socket_run ):
+            self.new_connection = None
+            connection, addr, connection_ok = self.__waitingForConnect()
+            if connection_ok:
+                self.new_connection = connection
+            while connection_ok and self.socket_run:
+                connection_ok, recv_ok, recv_data = self.__recvPkg( connection )
+                if connection_ok and recv_ok:
+                    self.cmd_vars_lck.acquire()
+                    self.cmd_vars_dict.update( self.__parseRevPkgBodyControlVars( recv_data ) )
+                    self.cmd_vars_lck.release()
+
+                if connection_ok == False or self.socket_run == False:
+                    connection.close()
+                    self.new_connection = None
+                    self.socket_tcp.close()
+                    print("connection error at port [{}] occured from [{}], disconnecting......".format(self.com_port, addr))
 
     def __encodeWideImage( self, quality=100 ):
         img = None
@@ -114,11 +275,13 @@ class CAlogrithmSocket:
             #img_code = img_code.tostring()
             img_code = self.turbojpeg.encode( img )
             pkgs = self.__package( img_code )
-            self.udp_buf_lck.acquire();
-            self.udp_buf.append( pkgs )
-            if len( self.udp_buf ) > self.buffer_size:
-                print("udp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.udp_buf)))
-            self.udp_buf_lck.release();
+            self.tcp_buf_lck.acquire();
+            if self.new_connection != None:
+                self.tcp_buf.append( pkgs )
+            if len( self.tcp_buf ) > self.buffer_size:
+                #print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
+                self.tcp_buf.pop(0);
+            self.tcp_buf_lck.release();
         else:
             time.sleep( 0.001 )
 
@@ -138,70 +301,43 @@ class CAlogrithmSocket:
             pos_code = self.__alignCompletion( pos_code, 7000 )
             pos_img_code = pos_code + img_code
             pkgs = self.__package( pos_img_code )
-            self.udp_buf_lck.acquire();
-            self.udp_buf.append( pkgs )
-            if len( self.udp_buf ) > self.buffer_size:
-                print("udp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.udp_buf)))
-            self.udp_buf_lck.release();
+            self.tcp_buf_lck.acquire();
+            if self.new_connection != None:
+                self.tcp_buf.append( pkgs )
+            if len( self.tcp_buf ) > self.buffer_size:
+                #print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
+                self.tcp_buf.pop(0);
+            self.tcp_buf_lck.release();
         else:
             time.sleep( 0.001 )
 
-    def __cmd_receiving( self ):
-        pkg_body = None
-        while( self.socket_run ):
-            pkg, addr = self.socket_udp.recvfrom( 9100 )
-            if addr[0] == self.com_ip:
-                pkg_body, received_finished = self.__parseRevPkgHead( pkg, pkg_body )
-                if received_finished and pkg_body is not None:
-                    self.cmd_vars_lck.acquire()
-                    self.cmd_vars_dict.update( self.__parseRevPkgBodyControlVars( pkg_body ) )
-                    self.cmd_vars_lck.release()
-                    pkg_body = None
-
-    def __parseRevPkgHead( self, pkg, pkg_body ):
-        pkg_head = json.loads(pkg[:100].decode("ascii"))
-        received_finished = False
-        if pkg_head['all_pkgs'] == pkg_head['pkg_index'] + 1:
-            received_finished = True
+    # def __parseRevPkgHead( self, pkg, pkg_body ):
+    #     pkg_head = json.loads(pkg[:100].decode("ascii"))
+    #     received_finished = False
+    #     if pkg_head['all_pkgs'] == pkg_head['pkg_index'] + 1:
+    #         received_finished = True
         
-        if received_finished:
-            if pkg_head['pkg_index'] == 0:
-                pkg_body = pkg[100:100+pkg_head['last_pkg_len']]
-            elif pkg_body is not None:
-                pkg_body = pkg_body + pkg[100:100+pkg_head['last_pkg_len']]
-        else:
-            if pkg_head['pkg_index'] == 0:
-                pkg_body = pkg[100:9100]
-            elif pkg_body is not None:
-                pkg_body = pkg_body + pkg[100:9100]
+    #     if received_finished:
+    #         if pkg_head['pkg_index'] == 0:
+    #             pkg_body = pkg[100:100+pkg_head['last_pkg_len']]
+    #         elif pkg_body is not None:
+    #             pkg_body = pkg_body + pkg[100:100+pkg_head['last_pkg_len']]
+    #     else:
+    #         if pkg_head['pkg_index'] == 0:
+    #             pkg_body = pkg[100:9100]
+    #         elif pkg_body is not None:
+    #             pkg_body = pkg_body + pkg[100:9100]
 
-        return pkg_body, received_finished
+    #     return pkg_body, received_finished
 
     def __parseRevPkgBodyControlVars( self, pkg_body ):
         return json.loads(pkg_body.decode("ascii"))
 
-    def __package( self, pkgs_body ):
-        all_pkgs = len(pkgs_body)//9000
-        last_pkg_len = len(pkgs_body) - all_pkgs*9000
-        if last_pkg_len == 0:
-            last_pkg_len= 9000
-        else:
-            all_pkgs = all_pkgs + 1
-
-        packages = []
-        for i in range( all_pkgs ):
-            if all_pkgs == i+1:
-                pkg_body = pkgs_body[i*9000:i*9000+last_pkg_len]
-                pkg_body = self.__alignCompletion( pkg_body, 9000 )
-            else:
-                pkg_body = pkgs_body[i*9000:(i+1)*9000]
-            pkg_head = {"all_pkgs":all_pkgs,"pkg_index":i,"last_pkg_len":last_pkg_len}
-            pkg_head = json.dumps( pkg_head ).encode("ascii")
-            pkg_head = self.__alignCompletion( pkg_head, 100 )
-            package = pkg_head + pkg_body
-            packages.append( package )
-
-        return packages
+    def __package( self, pkg_body ):
+        pkg_len = ("pkg_length:"+str(len(pkg_body))).encode("ascii")
+        pkg_len = self.__alignCompletion( pkg_len, self.pkg_head_len )
+        package = pkg_len + pkg_body
+        return package
 
     def __alignCompletion(self, pkg, all_size ):
         if len(pkg) >= all_size:
@@ -215,22 +351,31 @@ class CAlogrithmSocket:
         return pkg
 
 class CBackEndSocket: #using c++ library
-    def __init__(self, ip, port, enable_mass_receiving=False, receive_wide_or_telefocus_img = False, enable_cmd_receiving=False) -> None:
+    def __init__(self, ip, port, cmdRecv_massRecv=False, receive_wide_or_telefocus_img = False) -> None:
         self.socket_run = True
-        self.socket_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket_tcp = None
+        self.connect_to_sever_flag = False
         self.com_ip = ip
         self.com_port = port
         self.buffer_size = 3
+        self.pkg_head_len = 20
         self.turbojpeg = TurboJPEG()
-        if enable_mass_receiving:
-            self.lib = ctypes.cdll.LoadLibrary(os.path.dirname(__file__)+'/libudp_socket.so')
-            self.lib.massReceiving.argtypes = ( ctypes.c_int, ctypes.c_int )
-            self.lib.readPkgBdy.argtypes = ( ctypes.POINTER(ctypes.c_int), )
-            self.lib.readPkgBdy.restype = ctypes.POINTER(ctypes.c_ubyte)
-            self.massReceive_thread = Thread(target=self.__massReceive, args=(self.com_port, 9100) );
+        
+        if cmdRecv_massRecv:
+            self.cmd_vars_lck = Lock()
+            self.cmd_vars_dict = {}
+            self.cmd_receiving_thread = Thread(target=self.__cmd_receiving );
+            self.cmd_receiving_thread.start()
+            self.cmd_receiving_thread.setName('sck_cmd_rev_'+str(self.com_port))
+            print("started new thread [{}] for tcp command receiving data".format(self.cmd_receiving_thread.getName()))
+            
+        else:
+            self.pkgs_buf_lck = Lock()
+            self.pkgs_buf = []
+            self.massReceive_thread = Thread(target=self.__massReceive );
             self.massReceive_thread.start()
             self.massReceive_thread.setName('sck_mass_rev_'+str(self.com_port))
-            print("started new thread [{}] for udp mass receiving data".format(self.massReceive_thread.getName()))
+            print("started new thread [{}] for tcp mass receiving data".format(self.massReceive_thread.getName()))
 
             self.decoder_buf_lck = Lock()
             self.decoder_buf = []
@@ -239,27 +384,21 @@ class CBackEndSocket: #using c++ library
             self.imgDecoder_thread.setName('img_decoder_'+str(self.com_port))
             print("started new thread [{}] for decoding image data".format(self.imgDecoder_thread.getName()))
             
-        if enable_cmd_receiving:
-            self.socket_udp.bind( ('',self.com_port) )
-            self.cmd_receiving_thread = Thread(target=self.__cmd_receiving );
-            self.cmd_receiving_thread.start()
-            self.cmd_receiving_thread.setName('sck_cmd_rev_'+str(self.com_port))
-            print("started new thread [{}] for udp command receiving data".format(self.cmd_receiving_thread.getName()))
-            self.cmd_vars_lck = Lock()
-            self.cmd_vars_dict = {}
 
     def __del__( self ):
         self.socket_run = False
-        self.lib.stopReceiving()
         self.massReceive_thread.join();
         self.cmd_receiving_thread.join();
+        self.socket_tcp.close()
 
     def sendCMD( self, cmd, cmd_val ):
         cmd_dict = {cmd: cmd_val}
         cmd_dict = json.dumps( cmd_dict ).encode("ascii")
-        pkgs = self.__package( cmd_dict )
-        for pkg in pkgs:
-            self.socket_udp.sendto(pkg, (self.com_ip, self.com_port))
+        pkg = self.__package( cmd_dict )
+        if self.connect_to_sever_flag:
+            self.__sendPkg( self.socket_tcp, pkg )
+        else:
+            print("can't send command data, as connection failed!")
 
     def receiveCMD( self, cmd ):
         cmd_val = None
@@ -289,8 +428,180 @@ class CBackEndSocket: #using c++ library
         self.decoder_buf_lck.release()
         return pos, img
 
-    def __massReceive( self, port, pkg_size ):
-        self.lib.massReceiving( int(port), int(pkg_size) )
+    def __connectToSever( self ):
+        if self.socket_tcp != None:
+            self.socket_tcp.close()
+        self.socket_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+        self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
+        self.socket_tcp.settimeout( 3 )
+        print("created socket, target ip:[{}], target port:[{}]".format(self.com_ip, self.com_port))
+
+        #trying to connecting server
+        connection_ok = False;
+        try_connect_counter = 0
+        while try_connect_counter < 200:
+            try:
+                conn_status = self.socket_tcp.connect((self.com_ip, self.com_port))
+                if conn_status != socket.error:
+                    connection_ok = True;
+                    print("connecting to ip:{}, port:{} successfully".format(self.com_ip, self.com_port))
+                    try_connect_counter = 201
+                else:
+                    self.socket_tcp.close()
+                    print("try connecting to ip:{}, port:{} Failed! tried [{}] times again".format(self.com_ip, self.com_port, try_connect_counter))                    
+            except:
+                print("try connecting to ip:{}, port:{} Failed! tried [{}] times again".format(self.com_ip, self.com_port, try_connect_counter))
+            time.sleep(0.5)
+            try_connect_counter += 1;
+        
+        return connection_ok
+
+    def __sendData( self, connection, data ):
+        connection_ok = True; send_ok = True
+        try:
+            if not connection.send(data):
+                connection_ok = False
+        except socket.timeout:
+            send_ok = False
+        except:
+            connection_ok = False;
+        return connection_ok, send_ok
+
+    def __recvDataPart( self, connection, data_len ):
+        connection_ok = True; recv_ok = True
+        recv_len = 0;
+        recv_data = b'';
+        times_counter = 200;
+        while recv_len < data_len and connection_ok and times_counter > 0:
+            try:
+                recv_data_temp = connection.recv( data_len )
+                if recv_data_temp:
+                    recv_len += len( recv_data_temp )
+                    recv_data += recv_data_temp
+                else:
+                    connection_ok = False
+                times_counter -= 1
+            except socket.timeout:
+                recv_ok = False
+            except:
+                connection_ok = False
+        
+        if times_counter == 0:
+            recv_ok = False
+
+        return connection_ok, recv_ok, recv_data
+
+    def __recvData( self, connection ):
+        #receiving data_head
+        connection_ok, recv_ok, recv_data_head = self.__recvDataPart( connection, self.pkg_head_len )
+        if connection_ok == False or recv_ok == False:
+            return False, False, None #reset connection
+
+        head_ok = True
+        try:
+            data_head_decode = recv_data_head.decode("ascii")
+        except:
+            head_ok = False
+        if head_ok:
+            if data_head_decode[:11] != "pkg_length:":
+                head_ok = False
+        if head_ok == False:
+            return False, False, None #reset connection
+        
+        #receiving data_body
+        connection_ok, recv_ok, recv_data = self.__recvDataPart( connection, int( data_head_decode[11:self.pkg_head_len] ) )
+        if connection_ok == False or recv_ok == False:
+            return False, False, None #reset connection
+        return connection_ok, recv_ok, recv_data
+
+    def __sendPkg( self, connection, pkg ):
+        connection_ok, send_ok = self.__sendData( connection, pkg )
+        if connection_ok == False or send_ok == False:
+            return False, False
+
+        #receiving ack
+        connection_ok, recv_ok, recv_data = self.__recvData( connection )
+        if connection_ok == False or recv_ok == False:
+            return False, False
+
+        ack_ok = True
+        try:
+            recv_ack_decode = recv_data.decode("ascii")
+        except:
+            ack_ok = False
+        if ack_ok and len( recv_ack_decode ) >= 11:
+            if recv_ack_decode[:11] != "response:ok":
+                print("response ack error:", recv_ack_decode)
+                ack_ok = False
+        if ack_ok == False:
+            return False, False
+
+        return connection_ok, send_ok
+
+    def __recvPkg( self, connection ):
+        #receiving pkg_body
+        connection_ok, recv_ok, recv_data = self.__recvData( connection )
+        if connection_ok == False or recv_ok == False:
+            return False, False, None
+        
+        #sending response
+        ack = "response:ok"
+        ack_pkg = self.__package( ack.encode("ascii") )
+        connection_ok, send_ok = self.__sendData( connection, ack_pkg )
+        if connection_ok == False or send_ok == False:
+            return False, False, None
+
+        return connection_ok, recv_ok, recv_data
+
+    def __massReceive( self ):
+        recv_counter = 0;
+        while self.socket_run:
+            self.connect_to_sever_flag = False
+            connection_ok = self.__connectToSever()
+            if connection_ok:
+                self.connect_to_sever_flag = True
+            while self.socket_run and connection_ok :
+                #receiving package size
+                connection_ok, recv_ok, package = self.__recvPkg( self.socket_tcp )           
+                #receive package body
+                if connection_ok and recv_ok:
+                    self.pkgs_buf_lck.acquire()
+                    self.pkgs_buf.append( package )
+                    if len(self.pkgs_buf) > 10:
+                        print("rev pkgs_buf overflow: ", len(self.pkgs_buf))
+                    self.pkgs_buf_lck.release()
+                    #for debuging......
+                    recv_counter += 1;
+                    print(" received package over! recv_counter:", recv_counter)
+
+                if connection_ok == False or self.socket_run == False:
+                    self.socket_tcp.close()
+                    self.socket_tcp = None
+                    print( "connection with ip:{}, port:{} error! disconnecting......".format(self.com_ip, self.com_port ) )
+
+    def __cmd_receiving( self ):
+        while self.socket_run:
+            self.connect_to_sever_flag = False
+            connection_ok = self.__connectToSever()
+            if connection_ok:
+                self.connect_to_sever_flag = True
+            while self.socket_run and connection_ok :
+                connection_ok, recv_ok, recv_data = self.__recvPkg( self.socket_tcp )
+                if connection_ok and recv_ok:
+                    self.cmd_vars_lck.acquire()
+                    cmd_vars_dict_temp = self.__parseRevPkgBodyControlVars( recv_data )
+                    for k, v in cmd_vars_dict_temp.items():
+                        if k not in self.cmd_vars_dict.keys():
+                            self.cmd_vars_dict[k] = []
+                        self.cmd_vars_dict[k].append( v )
+                    self.cmd_vars_lck.release()
+
+                if connection_ok == False or self.socket_run == False:
+                    self.socket_tcp.close()
+                    self.socket_tcp = None
+                    print( "connection with ip:{}, port:{} error! disconnecting......".format(self.com_ip, self.com_port ) )
 
     def __imgDecoder(self, receive_wide_or_telefocus_img):
         while( self.socket_run ):
@@ -302,12 +613,11 @@ class CBackEndSocket: #using c++ library
     def __decodeWideImage( self ):
         img_code = None
         #read from buffer
-        c_pkg_bdy_size = ctypes.c_int(0)
-        img_code_ptr = self.lib.readPkgBdy(  ctypes.pointer( c_pkg_bdy_size ) );
-        pkg_bdy_size = c_pkg_bdy_size.value
-        if pkg_bdy_size > 0:                        
-            img_code = copy.deepcopy( ctypes.string_at( img_code_ptr, pkg_bdy_size ) )
-            self.lib.delPkgBdy();
+        self.pkgs_buf_lck.acquire()
+        if len(self.pkgs_buf) > 0:
+            img_code = self.pkgs_buf[0]
+            self.pkgs_buf.pop(0)
+        self.pkgs_buf_lck.release()
 
         if img_code is not None:
             #img_code = np.frombuffer( img_code, dtype = "uint8" )
@@ -325,12 +635,11 @@ class CBackEndSocket: #using c++ library
     def __decodePosAndTelefocusImg( self ):
         pos_img_code = None
         #read from buffer
-        c_pkg_bdy_size = ctypes.c_int(0)
-        pos_img_code_ptr = self.lib.readPkgBdy(  ctypes.pointer( c_pkg_bdy_size ) );
-        pkg_bdy_size = c_pkg_bdy_size.value
-        if pkg_bdy_size > 0:
-            pos_img_code = copy.deepcopy( ctypes.string_at( pos_img_code_ptr, pkg_bdy_size ) )
-            self.lib.delPkgBdy();
+        self.pkgs_buf_lck.acquire()
+        if len(self.pkgs_buf) > 0:
+            pos_img_code = self.pkgs_buf[0]
+            self.pkgs_buf.pop(0)
+        self.pkgs_buf_lck.release()
 
         if pos_img_code is not None:
             #img_code = np.frombuffer( img_code, dtype = "uint8" )
@@ -347,66 +656,33 @@ class CBackEndSocket: #using c++ library
         else:
             sleep( 0.0001 )
 
-    def __cmd_receiving( self ):
-        pkg_body = None
-        while( self.socket_run ):
-            pkg, addr = self.socket_udp.recvfrom( 9100 )
-            if addr[0] == self.com_ip:
-                pkg_body, received_finished = self.__parseRevPkgHead( pkg, pkg_body )
-                if received_finished and pkg_body is not None:
-                    self.cmd_vars_lck.acquire()
-                    cmd_vars_dict_temp = self.__parseRevPkgBodyControlVars( pkg_body )
-                    for k, v in cmd_vars_dict_temp.items():
-                        if k not in self.cmd_vars_dict.keys():
-                            self.cmd_vars_dict[k] = []
-                        self.cmd_vars_dict[k].append( v )
-                    self.cmd_vars_lck.release()
-                    pkg_body = None
-
-    def __parseRevPkgHead( self, pkg, pkg_body ):
-        pkg_head = json.loads(pkg[:100].decode("ascii"))
-        received_finished = False
-        if pkg_head['all_pkgs'] == pkg_head['pkg_index'] + 1:
-            received_finished = True
+    # def __parseRevPkgHead( self, pkg, pkg_body ):
+    #     pkg_head = json.loads(pkg[:100].decode("ascii"))
+    #     received_finished = False
+    #     if pkg_head['all_pkgs'] == pkg_head['pkg_index'] + 1:
+    #         received_finished = True
         
-        if received_finished:
-            if pkg_head['pkg_index'] == 0:
-                pkg_body = pkg[100:100+pkg_head['last_pkg_len']]
-            elif pkg_body is not None:
-                pkg_body = pkg_body + pkg[100:100+pkg_head['last_pkg_len']]
-        else:
-            if pkg_head['pkg_index'] == 0:
-                pkg_body = pkg[100:9100]
-            elif pkg_body is not None:
-                pkg_body = pkg_body + pkg[100:9100]
+    #     if received_finished:
+    #         if pkg_head['pkg_index'] == 0:
+    #             pkg_body = pkg[100:100+pkg_head['last_pkg_len']]
+    #         elif pkg_body is not None:
+    #             pkg_body = pkg_body + pkg[100:100+pkg_head['last_pkg_len']]
+    #     else:
+    #         if pkg_head['pkg_index'] == 0:
+    #             pkg_body = pkg[100:9100]
+    #         elif pkg_body is not None:
+    #             pkg_body = pkg_body + pkg[100:9100]
 
-        return pkg_body, received_finished
+    #     return pkg_body, received_finished
     
     def __parseRevPkgBodyControlVars( self, pkg_body ):
         return json.loads(pkg_body.decode("ascii"))
 
-    def __package( self, pkgs_body ):
-        all_pkgs = len(pkgs_body)//9000
-        last_pkg_len = len(pkgs_body) - all_pkgs*9000
-        if last_pkg_len == 0:
-            last_pkg_len= 9000
-        else:
-            all_pkgs = all_pkgs + 1
-
-        packages = []
-        for i in range( all_pkgs ):
-            if all_pkgs == i+1:
-                pkg_body = pkgs_body[i*9000:i*9000+last_pkg_len]
-                pkg_body = self.__alignCompletion( pkg_body, 9000 )
-            else:
-                pkg_body = pkgs_body[i*9000:(i+1)*9000]
-            pkg_head = {"all_pkgs":all_pkgs,"pkg_index":i,"last_pkg_len":last_pkg_len}
-            pkg_head = json.dumps( pkg_head ).encode("ascii")
-            pkg_head = self.__alignCompletion( pkg_head, 100 )
-            package = pkg_head + pkg_body
-            packages.append( package )
-
-        return packages
+    def __package( self, pkg_body ):
+        pkg_len = ("pkg_length:"+str(len(pkg_body))).encode("ascii")
+        pkg_len = self.__alignCompletion( pkg_len, self.pkg_head_len )
+        package = pkg_len + pkg_body
+        return package
 
     def __alignCompletion(self, pkg, all_size ):
         if len(pkg) >= all_size:
@@ -419,16 +695,15 @@ class CBackEndSocket: #using c++ library
         pkg = pkg + align_str
         return pkg
 
-
 if __name__ == '__main__':
     from backend_server_sim import TimerCounter
     tc = TimerCounter(300)
     tc.tStart("send")
 
-    wide_img_sck =  CAlogrithmSocket(host_ip, host_port, True, True, False )
-    cmd_sck      =  CAlogrithmSocket(host_ip, host_port+1, False, True , True )
-    telefocus_img_sck =  CAlogrithmSocket(host_ip, host_port+2, True, False, False )
-    run_freq = 80 #40fps
+    wide_img_sck =  CAlogrithmSocket(host_ip, communication_port, False, True )
+    cmd_sck      =  CAlogrithmSocket(host_ip, communication_port+1, True, True )
+    telefocus_img_sck =  CAlogrithmSocket(host_ip, communication_port+2, False, False )
+    run_freq = 10 #40fps
     galvos_num = 2
 
     mc_mode = "automation"
