@@ -179,17 +179,17 @@ def add_projection_points( img, projection_points_dict ):
     return img
 
 def rev_wide_window( ip, port, galvos_num, enable_record, mc_id_fps_share, mc_reprojection_share, id_fps_prj_lock ):
-    global mc_mode, mc_triger, mc_playback, mc_tracker, mc_reprojection, cmd_sck
+    global mc_mode, mc_triger, mc_playback, mc_tracker, mc_reprojection, cmd_sck_send, cmd_sck_recv
     def event_cam_wide_lbutton_down(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            global galvos_num, mc_mode, mc_triger, mc_playback, mc_tracker, mc_reprojection, cmd_sck
+            global galvos_num, mc_mode, mc_triger, mc_playback, mc_tracker, mc_reprojection, cmd_sck_send, cmd_sck_recv
             offset_x = galvos_num*1920
             if x > (offset_x+10) and x < (offset_x+110) and y > 100 and y < 200:
                 if mc_mode == "automation":
                     mc_mode = "manual"
                 else:
                     mc_mode = "automation"
-                cmd_sck.sendCMD( "mc_mode", mc_mode )
+                cmd_sck_send.sendCMD( "mc_mode", mc_mode )
 
             if x > (offset_x+10) and x < (offset_x+110) and y > 300 and y < 400:
                 if mc_mode == "manual":
@@ -197,14 +197,14 @@ def rev_wide_window( ip, port, galvos_num, enable_record, mc_id_fps_share, mc_re
                         mc_triger = "start"
                     else:
                         mc_triger = "finish"
-                    cmd_sck.sendCMD( "mc_triger", mc_triger )
+                    cmd_sck_send.sendCMD( "mc_triger", mc_triger )
 
             if x > (offset_x+10) and x < (offset_x+110) and y > 500 and y < 600:
                 if mc_playback == "enable":
                     mc_playback = "disable"
                 else:
                     mc_playback = "enable"
-                cmd_sck.sendCMD( "mc_playback", mc_playback )
+                cmd_sck_send.sendCMD( "mc_playback", mc_playback )
             
             if x > (offset_x+10) and x < (offset_x+110) and y > 700 and y < 800:
                 if mc_reprojection == "enable":
@@ -215,13 +215,14 @@ def rev_wide_window( ip, port, galvos_num, enable_record, mc_id_fps_share, mc_re
             if mc_mode == "manual":
                 if x < offset_x and y < 1080 and mc_mode == "manual":
                     mc_tracker = {"cam_index":x//1920,"x":(x-(x//1920)*1920)/1920.0,"y":y/1080.0}
-                    cmd_sck.sendCMD( "mc_tracker", mc_tracker  )
+                    cmd_sck_send.sendCMD( "mc_tracker", mc_tracker  )
     
     tc = TimerCounter( 300 )
     tc.tStart("rev_wide")
 
-    wide_img_sck =  CBackEndSocket(ip, port, False, True )
-    cmd_sck  =  CBackEndSocket(ip, port+1, True, True )
+    wide_img_sck =       CBackEndSocket(ip, port, True, True, False, False )
+    cmd_sck_send =  CBackEndSocket( ip, port+2, False, False, False, True )
+    cmd_sck_recv =  CBackEndSocket( ip, port+1, False, False, True, False )
 
     mc_mode = "automation"
     mc_triger="finish" 
@@ -253,7 +254,7 @@ def rev_wide_window( ip, port, galvos_num, enable_record, mc_id_fps_share, mc_re
             mc_reprojection_share.set( mc_reprojection )
             id_fps_prj_lock.release()
 
-        cmd = cmd_sck.receiveCMD( "mc_status" )
+        cmd = cmd_sck_recv.receiveCMD( "mc_status" )
         if cmd is not None:
             mc_status = cmd
             print("get mc_status:",mc_status)
@@ -272,7 +273,7 @@ def rev_wide_window( ip, port, galvos_num, enable_record, mc_id_fps_share, mc_re
 def rev_telefocus_window( ip, port, galvos_num, enable_record, mc_id_fps_share, mc_reprojection_share, id_fps_prj_lock, sk_pos_share, sk_pos_lock ):
     tc = TimerCounter( 300 )
     tc.tStart("rev_telefocus")
-    img_show = True
+    img_show = False
     save_path = "./"
     save_txt_file =  None
     save_video_file = None
@@ -280,8 +281,8 @@ def rev_telefocus_window( ip, port, galvos_num, enable_record, mc_id_fps_share, 
     mc_fps = 0
     mc_reprojection = "disable"
 
-    telefocus_img_sck =  CBackEndSocket(ip, port+2, False, False )
-    
+    telefocus_img_sck =  CBackEndSocket(ip, port+3, True, False, False, False )
+
     if img_show:
         cv2.namedWindow("cam Telefocus",0)
     telefocus_img = np.zeros((1440*galvos_num, 1080, 3), np.uint8)
