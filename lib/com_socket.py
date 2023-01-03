@@ -5,6 +5,7 @@ import socket, time, cv2
 from threading import Lock, Thread
 import json
 from turbojpeg import TurboJPEG, TJPF_BGR
+from nvjpeg import NvJpeg
 import ctypes, os, copy
 
 server_ip = "192.168.123.68"
@@ -21,6 +22,7 @@ class CAlogrithmSocket:
         self.buffer_size = 3
         self.pkg_head_len = 20
         self.turbojpeg = TurboJPEG()
+        self.nj = NvJpeg()
 
         if enable_mass_send + enable_cmd_sending + enable_cmd_receiving > 1:
             print("error: init CAlogrithmSocket")
@@ -148,7 +150,7 @@ class CAlogrithmSocket:
         connection_ok = True; recv_ok = True
         recv_len = 0;
         recv_data = b'';
-        times_counter = 200;
+        times_counter = 1000;
         while recv_len < data_len and connection_ok and times_counter > 0:
             try:
                 recv_data_temp = connection.recv( data_len )
@@ -271,13 +273,14 @@ class CAlogrithmSocket:
                 send_data = self.__packageControlVars()
                 if send_data != None:
                     connection_ok, send_ok = self.__sendPkg( connection, send_data )
-                time.sleep(0.01)
-
+                
                 if connection_ok == False or self.socket_run == False:
                     connection.close()
                     self.new_connection = None
                     self.socket_tcp.close()
                     print("connection error at port [{}] occured from [{}], disconnecting......".format(self.com_port, addr))
+
+                time.sleep(0.01)
 
     def __cmdRecv( self ):
         while( self.socket_run ):
@@ -309,12 +312,13 @@ class CAlogrithmSocket:
             #_, img_code = cv2.imencode('.jpg', img,[int(cv2.IMWRITE_JPEG_QUALITY),quality] )
             #img_code = img_code.tostring()
             img_code = self.turbojpeg.encode( img )
+            #img_code = self.nj.encode( img )
             pkgs = self.__package( img_code )
             self.tcp_buf_lck.acquire();
             if self.new_connection != None:
                 self.tcp_buf.append( pkgs )
             if len( self.tcp_buf ) > self.buffer_size:
-                #print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
+                print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
                 self.tcp_buf.pop(0);
             self.tcp_buf_lck.release();
         else:
@@ -332,6 +336,7 @@ class CAlogrithmSocket:
             #_, img_code = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY),quality] )
             #img_code = img_code.tostring()
             img_code = self.turbojpeg.encode( img )
+            #img_code = self.nj.encode( img )
             pos_code = json.dumps( pos ).encode("ascii")
             pos_code = self.__alignCompletion( pos_code, 7000 )
             pos_img_code = pos_code + img_code
@@ -340,7 +345,7 @@ class CAlogrithmSocket:
             if self.new_connection != None:
                 self.tcp_buf.append( pkgs )
             if len( self.tcp_buf ) > self.buffer_size:
-                #print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
+                print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
                 self.tcp_buf.pop(0);
             self.tcp_buf_lck.release();
         else:
@@ -386,7 +391,7 @@ class CAlogrithmSocket:
         if not cmd_dict:
             return None
         
-        return json.dumps( cmd_dict ).encode("ascii")
+        return self.__package( json.dumps( cmd_dict ).encode("ascii"))
 
     def __package( self, pkg_body ):
         pkg_len = ("pkg_length:"+str(len(pkg_body))).encode("ascii")
@@ -415,6 +420,7 @@ class CBackEndSocket: #using c++ library
         self.buffer_size = 3
         self.pkg_head_len = 20
         self.turbojpeg = TurboJPEG()
+        self.nj = NvJpeg()
 
         if enable_mass_receive + enable_cmd_sending + enable_cmd_receiving > 1:
             print("error: init CBackEndSocket")
@@ -540,7 +546,7 @@ class CBackEndSocket: #using c++ library
         connection_ok = True; recv_ok = True
         recv_len = 0;
         recv_data = b'';
-        times_counter = 200;
+        times_counter = 1000;
         while recv_len < data_len and connection_ok and times_counter > 0:
             try:
                 recv_data_temp = connection.recv( data_len )
@@ -659,13 +665,14 @@ class CBackEndSocket: #using c++ library
                 send_data = self.__packageControlVars()
                 if send_data != None:
                     connection_ok, send_ok = self.__sendPkg( self.socket_tcp, send_data )
-                time.sleep(0.01)
-
+                
                 if connection_ok == False or self.socket_run == False:
                     self.socket_tcp.close()
                     self.socket_tcp = None
                     print( "connection with ip:{}, port:{} error! disconnecting......".format(self.com_ip, self.com_port ) )
 
+                time.sleep(0.01)
+                
     def __cmdRecv( self ):
         while self.socket_run:
             self.connect_to_sever_flag = False
@@ -703,6 +710,7 @@ class CBackEndSocket: #using c++ library
             #img_code = np.frombuffer( img_code, dtype = "uint8" )
             #img = cv2.imdecode( img_code, cv2.IMREAD_COLOR )
             img = self.turbojpeg.decode( img_code, pixel_format=TJPF_BGR )
+            #img = self.nj.decode( img_code )
             self.decoder_buf_lck.acquire()
             self.decoder_buf.append( img )
             if len( self.decoder_buf ) > self.buffer_size:
@@ -725,6 +733,7 @@ class CBackEndSocket: #using c++ library
             #img_code = np.frombuffer( img_code, dtype = "uint8" )
             #img = cv2.imdecode( img_code, cv2.IMREAD_COLOR )
             img = self.turbojpeg.decode( pos_img_code[7000:], pixel_format=TJPF_BGR)
+            #img = self.nj.decode( pos_img_code[7000:] )
             pos_code = pos_img_code[:7000].decode("ascii")
             pos = json.loads(pos_code)
             self.decoder_buf_lck.acquire()
@@ -776,7 +785,7 @@ class CBackEndSocket: #using c++ library
         if not cmd_dict:
             return None
         
-        return json.dumps( cmd_dict ).encode("ascii")
+        return self.__package( json.dumps( cmd_dict ).encode("ascii") )
 
     def __package( self, pkg_body ):
         pkg_len = ("pkg_length:"+str(len(pkg_body))).encode("ascii")
@@ -821,6 +830,8 @@ if __name__ == '__main__':
 
     wide_img = np.zeros((1080,1920*galvos_num, 3), np.uint8)
     telefocus_img = np.zeros((1080, 1440*galvos_num, 3), np.uint8)
+    wide_img = np.random.randint( 255, size=wide_img.shape, dtype=np.uint8 )
+    telefocus_img = np.random.randint( 255, size=telefocus_img.shape, dtype=np.uint8 )
     pos_num = 0
     play_back_counter = 0;
     while( True ):

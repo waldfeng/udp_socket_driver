@@ -52,5 +52,6 @@
         "streambuf": "cpp",
         "cinttypes": "cpp",
         "typeinfo": "cpp"
-    }
+    },
+    "python.pythonPath": "/home/fcz/anaconda3/envs/PTandTF/bin/python"
 }
