@@ -5,7 +5,7 @@ import socket, time, cv2
 from threading import Lock, Thread
 import json
 from turbojpeg import TurboJPEG, TJPF_BGR
-from nvjpeg import NvJpeg
+#from nvjpeg import NvJpeg
 import ctypes, os, copy
 
 server_ip = "192.168.123.68"
@@ -13,16 +13,17 @@ host_ip = "192.168.123.67"
 communication_port = 6000
 
 class CAlogrithmSocket:
-    def __init__(self, ip, port, enable_mass_send=False, send_wide_or_telefocus_img=False, enable_cmd_receiving=False, enable_cmd_sending=False ) -> None:
+    def __init__(self, ip, port, enable_mass_send=False, send_wide_or_telefocus_img=False, enable_cmd_receiving=False, enable_cmd_sending=False, encode_quality = 40 ) -> None:
         self.socket_run = True
         self.socket_tcp = None
         self.new_connection = None
         self.com_ip = ip
         self.com_port = port
+        self.encode_quality = encode_quality
         self.buffer_size = 3
         self.pkg_head_len = 20
         self.turbojpeg = TurboJPEG()
-        self.nj = NvJpeg()
+        # self.nj = NvJpeg()
 
         if enable_mass_send + enable_cmd_sending + enable_cmd_receiving > 1:
             print("error: init CAlogrithmSocket")
@@ -92,14 +93,14 @@ class CAlogrithmSocket:
     def sendWideImage( self, img ):
         self.encoder_buf_lck.acquire()
         self.encoder_buf.append( img )
-        if len( self.encoder_buf ) > self.buffer_size:
+        if len( self.encoder_buf ) % (self.buffer_size*10) == 0 and len( self.encoder_buf ) > 0:
             print("encode wide image buffer overflow:{}".format( len(self.encoder_buf)))
         self.encoder_buf_lck.release();
 
     def sendPosAndTelefocusImg( self, img, pos ):
         self.encoder_buf_lck.acquire()
         self.encoder_buf.append( [pos, img] )
-        if len( self.encoder_buf ) > self.buffer_size:
+        if len( self.encoder_buf ) % (self.buffer_size*10) == 0 and len( self.encoder_buf ) > 0:
             print("encode pos and telefocus img buffer overflow:{}".format( len(self.encoder_buf)))
         self.encoder_buf_lck.release();
 
@@ -118,7 +119,7 @@ class CAlogrithmSocket:
         self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
         self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
-        self.socket_tcp.settimeout( 3 )
+        # self.socket_tcp.settimeout( 3 )
         print("created socket, target ip:[{}], target port:[{}]".format(self.com_ip, self.com_port))
         self.socket_tcp.bind( ('',self.com_port) )
         self.socket_tcp.listen( 3 )
@@ -142,7 +143,8 @@ class CAlogrithmSocket:
                 connection_ok = False
         except socket.timeout:
             send_ok = False
-        except:
+        except Exception as ex:
+            print("send Data exception: ", ex)
             connection_ok = False;
         return connection_ok, send_ok
 
@@ -158,11 +160,14 @@ class CAlogrithmSocket:
                     recv_len += len( recv_data_temp )
                     recv_data += recv_data_temp
                 else:
-                    connection_ok = False
+                    time.sleep( 0.0001 )
+                    # print( "recv data part error:", recv_data_temp )
+                    # connection_ok = False
                 times_counter -= 1
             except socket.timeout:
-                recv_ok = False
-            except:
+                pass
+            except Exception as ex:
+                print("recv data part exception: ",ex)
                 connection_ok = False
         
         if times_counter == 0:
@@ -179,7 +184,8 @@ class CAlogrithmSocket:
         head_ok = True
         try:
             data_head_decode = recv_data_head.decode("ascii")
-        except:
+        except Exception as ex:
+            print("data head decode exception: ",ex)
             head_ok = False
         if head_ok:
             if data_head_decode[:11] != "pkg_length:":
@@ -206,7 +212,8 @@ class CAlogrithmSocket:
         ack_ok = True
         try:
             recv_ack_decode = recv_data.decode("ascii")
-        except:
+        except Exception as ex:
+            print("recv ack data decode exception: ", ex)
             ack_ok = False
         if ack_ok and len( recv_ack_decode ) >= 11:
             if recv_ack_decode[:11] != "response:ok":
@@ -311,13 +318,13 @@ class CAlogrithmSocket:
         if img is not None:
             #_, img_code = cv2.imencode('.jpg', img,[int(cv2.IMWRITE_JPEG_QUALITY),quality] )
             #img_code = img_code.tostring()
-            img_code = self.turbojpeg.encode( img )
-            #img_code = self.nj.encode( img )
+            img_code = self.turbojpeg.encode( img, self.encode_quality )
+            #img_code = self.nj.encode( img , self.encode_quality )
             pkgs = self.__package( img_code )
             self.tcp_buf_lck.acquire();
             if self.new_connection != None:
                 self.tcp_buf.append( pkgs )
-            if len( self.tcp_buf ) > self.buffer_size:
+            if len( self.tcp_buf )  > self.buffer_size:
                 print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
                 self.tcp_buf.pop(0);
             self.tcp_buf_lck.release();
@@ -335,8 +342,8 @@ class CAlogrithmSocket:
         if pos is not None:
             #_, img_code = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY),quality] )
             #img_code = img_code.tostring()
-            img_code = self.turbojpeg.encode( img )
-            #img_code = self.nj.encode( img )
+            img_code = self.turbojpeg.encode( img, self.encode_quality )
+            #img_code = self.nj.encode( img, self.encode_quality )
             pos_code = json.dumps( pos ).encode("ascii")
             pos_code = self.__alignCompletion( pos_code, 7000 )
             pos_img_code = pos_code + img_code
@@ -344,7 +351,7 @@ class CAlogrithmSocket:
             self.tcp_buf_lck.acquire();
             if self.new_connection != None:
                 self.tcp_buf.append( pkgs )
-            if len( self.tcp_buf ) > self.buffer_size:
+            if len(self.tcp_buf) > self.buffer_size:
                 print("tcp sending buffer overflow, port: {}, num:{}".format( self.com_port, len(self.tcp_buf)))
                 self.tcp_buf.pop(0);
             self.tcp_buf_lck.release();
@@ -357,9 +364,7 @@ class CAlogrithmSocket:
     #     if pkg_head['all_pkgs'] == pkg_head['pkg_index'] + 1:
     #         received_finished = True
         
-    #     if received_finished:
-    #         if pkg_head['pkg_index'] == 0:
-    #             pkg_body = pkg[100:100+pkg_head['last_pkg_len']]
+    #     if receivedself.buffer_size_body = pkg[100:100+pkg_head['last_pkg_len']]
     #         elif pkg_body is not None:
     #             pkg_body = pkg_body + pkg[100:100+pkg_head['last_pkg_len']]
     #     else:
@@ -411,16 +416,17 @@ class CAlogrithmSocket:
         return pkg
 
 class CBackEndSocket: #using c++ library
-    def __init__(self, ip, port, enable_mass_receive=False, receive_wide_or_telefocus_img=False, enable_cmd_receiving=False, enable_cmd_sending=False) -> None:
+    def __init__(self, ip, port, enable_mass_receive=False, receive_wide_or_telefocus_img=False, enable_cmd_receiving=False, enable_cmd_sending=False, encode_quality = 100) -> None:
         self.socket_run = True
         self.socket_tcp = None
         self.connect_to_sever_flag = False
         self.com_ip = ip
         self.com_port = port
+        self.encode_quality = encode_quality
         self.buffer_size = 3
         self.pkg_head_len = 20
         self.turbojpeg = TurboJPEG()
-        self.nj = NvJpeg()
+        # self.nj = NvJpeg()
 
         if enable_mass_receive + enable_cmd_sending + enable_cmd_receiving > 1:
             print("error: init CBackEndSocket")
@@ -508,7 +514,7 @@ class CBackEndSocket: #using c++ library
         self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
         self.socket_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
-        self.socket_tcp.settimeout( 3 )
+        # self.socket_tcp.settimeout( 3 )
         print("created socket, target ip:[{}], target port:[{}]".format(self.com_ip, self.com_port))
 
         #trying to connecting server
@@ -524,9 +530,9 @@ class CBackEndSocket: #using c++ library
                 else:
                     self.socket_tcp.close()
                     print("try connecting to ip:{}, port:{} Failed! tried [{}] times again".format(self.com_ip, self.com_port, try_connect_counter))                    
-            except:
-                print("try connecting to ip:{}, port:{} Failed! tried [{}] times again".format(self.com_ip, self.com_port, try_connect_counter))
-            time.sleep(0.5)
+            except Exception as ex:
+                print("try connecting to ip:{}, port:{} Exception:{} ! tried [{}] times again".format(self.com_ip, self.com_port, ex, try_connect_counter))
+            time.sleep(1)
             try_connect_counter += 1;
         
         return connection_ok
@@ -538,7 +544,8 @@ class CBackEndSocket: #using c++ library
                 connection_ok = False
         except socket.timeout:
             send_ok = False
-        except:
+        except Exception as ex:
+            print("send Data exception: ", ex)
             connection_ok = False;
         return connection_ok, send_ok
 
@@ -554,11 +561,14 @@ class CBackEndSocket: #using c++ library
                     recv_len += len( recv_data_temp )
                     recv_data += recv_data_temp
                 else:
-                    connection_ok = False
+                    time.sleep( 0.0001 )
+                    # print( "recv data part error:", recv_data_temp )
+                    # connection_ok = False
                 times_counter -= 1
             except socket.timeout:
-                recv_ok = False
-            except:
+                pass
+            except Exception as ex:
+                print("recv data part exception: ",ex)
                 connection_ok = False
         
         if times_counter == 0:
@@ -575,7 +585,8 @@ class CBackEndSocket: #using c++ library
         head_ok = True
         try:
             data_head_decode = recv_data_head.decode("ascii")
-        except:
+        except Exception as ex:
+            print("data head decode exception: ",ex)
             head_ok = False
         if head_ok:
             if data_head_decode[:11] != "pkg_length:":
@@ -602,7 +613,8 @@ class CBackEndSocket: #using c++ library
         ack_ok = True
         try:
             recv_ack_decode = recv_data.decode("ascii")
-        except:
+        except Exception as ex:
+            print("recv ack data decode exception: ", ex)
             ack_ok = False
         if ack_ok and len( recv_ack_decode ) >= 11:
             if recv_ack_decode[:11] != "response:ok":
@@ -642,7 +654,7 @@ class CBackEndSocket: #using c++ library
                 if connection_ok and recv_ok:
                     self.pkgs_buf_lck.acquire()
                     self.pkgs_buf.append( package )
-                    if len(self.pkgs_buf) > 10:
+                    if len(self.pkgs_buf) % 100 == 0 and len(self.pkgs_buf) > 0:
                         print("rev pkgs_buf overflow: ", len(self.pkgs_buf))
                     self.pkgs_buf_lck.release()
                     #for debuging......
@@ -713,7 +725,7 @@ class CBackEndSocket: #using c++ library
             #img = self.nj.decode( img_code )
             self.decoder_buf_lck.acquire()
             self.decoder_buf.append( img )
-            if len( self.decoder_buf ) > self.buffer_size:
+            if len( self.decoder_buf )  > self.buffer_size :
                 print("decode wide image buffer overflow:{}".format( len(self.decoder_buf)))
                 self.decoder_buf.pop(0)
             self.decoder_buf_lck.release( )
@@ -814,7 +826,7 @@ if __name__ == '__main__':
     cmd_sck_send =  CAlogrithmSocket(host_ip, communication_port+1, False, False, False, True )
     cmd_sck_recv =  CAlogrithmSocket(host_ip, communication_port+2, False, False, True, False )
 
-    run_freq = 100 #40fps
+    run_freq = 40 #40fps
     galvos_num = 2
 
     mc_mode = "automation"
